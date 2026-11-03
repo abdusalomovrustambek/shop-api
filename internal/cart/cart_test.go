@@ -211,7 +211,7 @@ func TestApplyCoupon(t *testing.T) {
 	for _, code := range []string{"EXPIRED5", "NOSUCHCODE", "FREESHIP"} {
 		t.Run(code, func(t *testing.T) {
 			rec := app.Do(http.MethodPost, "/api/cart/coupon", token, fmt.Sprintf(`{"code":%q}`, code))
-			if rec.Code != http.StatusUnprocessable {
+			if rec.Code != http.StatusUnprocessableEntity {
 				t.Fatalf("status = %d, want 422; body %s", rec.Code, rec.Body)
 			}
 			if got := getCart(t, app, token); got.TotalCents != 1800 || got.CouponCode == nil || *got.CouponCode != "WELCOME10" {

@@ -3,13 +3,21 @@ package order_test
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/rustambekabdusalomov/shop-api/internal/apptest"
+	"github.com/rustambekabdusalomov/shop-api/internal/auth"
 	"github.com/rustambekabdusalomov/shop-api/internal/order"
+	"github.com/rustambekabdusalomov/shop-api/internal/server"
 	"github.com/rustambekabdusalomov/shop-api/internal/testdb"
 )
 
@@ -355,6 +363,147 @@ func TestOrdersListNewestFirst(t *testing.T) {
 		}
 		if len(o.Items) != 1 {
 			t.Errorf("order %d has %d items, want 1", o.ID, len(o.Items))
+		}
+	}
+}
+
+func TestStoredCouponThatStoppedApplyingIsDropped(t *testing.T) {
+	app := apptest.New(t)
+	token := app.Token(t, alice)
+	id := testdb.InsertProduct(t, app.Pool, "T-1", 1000, 50)
+	path := fmt.Sprintf("/api/cart/items/%d", id)
+
+	// FREESHIP needs a cart of at least 3000 cents; shrinking the cart afterwards must not trap it.
+	addToCart(t, app, token, id, 3)
+	if rec := app.Do(http.MethodPost, "/api/cart/coupon", token, `{"code":"FREESHIP"}`); rec.Code != http.StatusOK {
+		t.Fatalf("coupon: status %d, body %s", rec.Code, rec.Body)
+	}
+	if rec := app.Do(http.MethodPatch, path, token, `{"quantity":1}`); rec.Code != http.StatusOK {
+		t.Fatalf("patch: status %d, body %s", rec.Code, rec.Body)
+	}
+	rec := app.Do(http.MethodPost, "/api/checkout", token, checkoutUSD)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("checkout with a cart coupon below its minimum: status %d, body %s", rec.Code, rec.Body)
+	}
+	o := apptest.Decode[order.Order](t, rec)
+	if o.SubtotalCents != 1000 || o.DiscountCents != 0 || o.TotalCents != 1000 || o.CouponCode != nil {
+		t.Errorf("order = %+v, want full price and no coupon", o)
+	}
+
+	// A coupon that expired after it was applied behaves the same.
+	addToCart(t, app, token, id, 1)
+	if rec := app.Do(http.MethodPost, "/api/cart/coupon", token, `{"code":"WELCOME10"}`); rec.Code != http.StatusOK {
+		t.Fatalf("coupon: status %d, body %s", rec.Code, rec.Body)
+	}
+	if _, err := app.Pool.Exec(context.Background(), `UPDATE shop.coupons SET expires_at = now() - interval '1 hour' WHERE code = 'WELCOME10'`); err != nil {
+		t.Fatalf("expire coupon: %v", err)
+	}
+	rec = app.Do(http.MethodPost, "/api/checkout", token, checkoutUSD)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("checkout with an expired cart coupon: status %d, body %s", rec.Code, rec.Body)
+	}
+	if o := apptest.Decode[order.Order](t, rec); o.DiscountCents != 0 || o.CouponCode != nil {
+		t.Errorf("order = %+v, want full price and no coupon", o)
+	}
+
+	// The same coupon named in the request is refused.
+	addToCart(t, app, token, id, 1)
+	body := `{"currency":"USD","coupon_code":"WELCOME10","card":{"number":"4111111111111111","exp":"12/29","cvc":"123"}}`
+	if rec := app.Do(http.MethodPost, "/api/checkout", token, body); rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("expired coupon in the request: status %d, want 422", rec.Code)
+	}
+}
+
+func TestRequestedCouponWinsOverTheCartCoupon(t *testing.T) {
+	app := apptest.New(t)
+	token := app.Token(t, alice)
+	id := testdb.InsertProduct(t, app.Pool, "T-1", 2000, 50)
+	addToCart(t, app, token, id, 1)
+	if rec := app.Do(http.MethodPost, "/api/cart/coupon", token, `{"code":"WELCOME10"}`); rec.Code != http.StatusOK {
+		t.Fatalf("coupon: status %d, body %s", rec.Code, rec.Body)
+	}
+
+	body := `{"currency":"USD","coupon_code":"TEAM50","card":{"number":"4111111111111111","exp":"12/29","cvc":"123"}}`
+	rec := app.Do(http.MethodPost, "/api/checkout", token, body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("checkout: status %d, body %s", rec.Code, rec.Body)
+	}
+	o := apptest.Decode[order.Order](t, rec)
+	// TEAM50 is a fixed 5000 capped at the subtotal; WELCOME10 would have given 200.
+	if o.DiscountCents != 2000 || o.TotalCents != 0 || o.CouponCode == nil || *o.CouponCode != "TEAM50" {
+		t.Errorf("order = %+v, want TEAM50 with discount 2000", o)
+	}
+}
+
+func TestCheckoutRollsBackWhenTheJobCannotBeQueued(t *testing.T) {
+	app := apptest.New(t)
+	token := app.Token(t, alice)
+	id := testdb.InsertProduct(t, app.Pool, "T-1", 1000, 10)
+	addToCart(t, app, token, id, 2)
+	if _, err := app.Pool.Exec(context.Background(), `DROP TABLE billing.jobs`); err != nil {
+		t.Fatalf("drop billing.jobs: %v", err)
+	}
+
+	// The order, its items and the stock decrement are written before the job insert fails.
+	if rec := app.Do(http.MethodPost, "/api/checkout", token, checkoutUSD); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body %s", rec.Code, rec.Body)
+	}
+	for _, table := range []string{"shop.orders", "shop.order_items"} {
+		if n := count(t, app, `SELECT count(*) FROM `+table); n != 0 {
+			t.Errorf("%s has %d rows after the failed checkout, want 0", table, n)
+		}
+	}
+	if got := stockOf(t, app, id); got != 10 {
+		t.Errorf("stock = %d, want 10", got)
+	}
+	if n := count(t, app, `SELECT coalesce(sum(quantity), 0) FROM shop.cart_items`); n != 2 {
+		t.Errorf("cart holds %d units, want it untouched with 2", n)
+	}
+}
+
+func TestConcurrentCouponCheckoutsDoNotExhaustTheConnectionPool(t *testing.T) {
+	app := apptest.New(t)
+	tokens := []string{app.Token(t, alice), app.Token(t, bob)}
+	id := testdb.InsertProduct(t, app.Pool, "T-1", 1000, 10)
+	for _, token := range tokens {
+		addToCart(t, app, token, id, 1)
+		if rec := app.Do(http.MethodPost, "/api/cart/coupon", token, `{"code":"WELCOME10"}`); rec.Code != http.StatusOK {
+			t.Fatalf("coupon: status %d, body %s", rec.Code, rec.Body)
+		}
+	}
+
+	// As many connections as concurrent checkouts: a checkout that needs a second
+	// connection while it holds one would wait for the other forever.
+	cfg := app.Pool.Config()
+	cfg.MaxConns = 2
+	small, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("small pool: %v", err)
+	}
+	t.Cleanup(small.Close)
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	h := server.New(server.Deps{Pool: small, Verifier: auth.NewVerifier(app.Issuer.URL(), log), Log: log, Stderr: io.Discard})
+
+	codes := make(chan int, len(tokens))
+	for _, token := range tokens {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/checkout", strings.NewReader(checkoutUSD))
+			req.Header.Set("Authorization", "Bearer "+token)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			codes <- rec.Code
+		}()
+	}
+	for range tokens {
+		select {
+		case code := <-codes:
+			if code != http.StatusCreated {
+				t.Errorf("checkout: status %d, want 201", code)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("checkouts are stuck: they wait for pool connections they cannot get")
 		}
 	}
 }

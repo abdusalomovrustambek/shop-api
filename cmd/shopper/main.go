@@ -117,6 +117,8 @@ type shopper struct {
 	log      *slog.Logger
 	accounts []*account
 	products []int64
+	// fast skips the pacing between requests (tests).
+	fast bool
 }
 
 func newShopper(cfg config, out io.Writer, log *slog.Logger, seed uint64) *shopper {
@@ -188,7 +190,7 @@ func (s *shopper) call(ctx context.Context, a *account, method, path string, bod
 }
 
 func (s *shopper) pause(ctx context.Context) {
-	if s.cfg.dryRun {
+	if s.cfg.dryRun || s.fast {
 		return
 	}
 	sleep(ctx, time.Duration(333+s.rng.IntN(667))*time.Millisecond)
@@ -294,9 +296,40 @@ func checkoutBody(currency, couponCode string) map[string]any {
 	return body
 }
 
+// checkout places the order. When the server refuses it (sold out, a crash), the cart is
+// emptied so the leftovers do not break every later trip of this account.
 func (s *shopper) checkout(ctx context.Context, a *account, currency, couponCode string) error {
-	_, err := s.call(ctx, a, http.MethodPost, "/api/checkout", checkoutBody(currency, couponCode))
-	return err
+	r, err := s.call(ctx, a, http.MethodPost, "/api/checkout", checkoutBody(currency, couponCode))
+	if err != nil {
+		return err
+	}
+	if r.status/100 == 2 {
+		return nil
+	}
+	return s.emptyCart(ctx, a)
+}
+
+// emptyCart sets every line of the account's cart to quantity 0.
+func (s *shopper) emptyCart(ctx context.Context, a *account) error {
+	r, err := s.call(ctx, a, http.MethodGet, "/api/cart", nil)
+	if err != nil {
+		return err
+	}
+	var cart struct {
+		Items []struct {
+			ProductID int64 `json:"product_id"`
+		} `json:"items"`
+	}
+	if json.Unmarshal(r.body, &cart) != nil {
+		return nil
+	}
+	for _, it := range cart.Items {
+		path := fmt.Sprintf("/api/cart/items/%d", it.ProductID)
+		if _, err := s.call(ctx, a, http.MethodPatch, path, map[string]int{"quantity": 0}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // session is one normal shopping trip: sign in, browse, search, fill the cart, use a

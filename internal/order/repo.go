@@ -79,15 +79,14 @@ type line struct {
 
 // Repo reads and writes orders.
 type Repo struct {
-	db      *pgxpool.Pool
-	coupons *coupon.Repo
-	log     *slog.Logger
-	now     func() time.Time
+	db  *pgxpool.Pool
+	log *slog.Logger
+	now func() time.Time
 }
 
 // NewRepo returns a Repo on db.
-func NewRepo(db *pgxpool.Pool, coupons *coupon.Repo, log *slog.Logger) *Repo {
-	return &Repo{db: db, coupons: coupons, log: log, now: time.Now}
+func NewRepo(db *pgxpool.Pool, log *slog.Logger) *Repo {
+	return &Repo{db: db, log: log, now: time.Now}
 }
 
 // Checkout turns the user's cart into an order in one transaction: it locks the products,
@@ -127,22 +126,10 @@ func (r *Repo) Checkout(ctx context.Context, in CheckoutInput) (Order, error) {
 		couponLines[i] = coupon.Line{SKU: l.SKU, Quantity: l.Quantity, UnitPriceCents: l.UnitPriceCents}
 	}
 
-	code := in.CouponCode
-	if code == "" && cartCoupon != nil {
-		code = *cartCoupon
-	}
 	subtotal := coupon.Subtotal(couponLines)
-	var discount int64
-	var appliedCode *string
-	if code != "" {
-		cp, err := r.coupons.ByCode(ctx, code)
-		if err != nil {
-			return Order{}, err
-		}
-		if discount, err = coupon.Discount(cp, couponLines, r.now()); err != nil {
-			return Order{}, err
-		}
-		appliedCode = &cp.Code
+	discount, appliedCode, err := r.discount(ctx, tx, in.CouponCode, cartCoupon, couponLines)
+	if err != nil {
+		return Order{}, err
 	}
 
 	o := Order{
@@ -197,6 +184,32 @@ func (r *Repo) Checkout(ctx context.Context, in CheckoutInput) (Order, error) {
 		return Order{}, fmt.Errorf("commit checkout: %w", err)
 	}
 	return o, nil
+}
+
+// discount prices the coupon of an order, reading it through tx. A coupon named in the
+// request must apply, or the checkout is refused (422). The coupon stored on the cart may
+// have stopped applying since it was added (expired, or the cart shrank below its minimum):
+// then the order is made at full price, as the cart view shows it.
+func (r *Repo) discount(ctx context.Context, tx pgx.Tx, requested string, stored *string, lines []coupon.Line) (int64, *string, error) {
+	code, explicit := requested, requested != ""
+	if !explicit {
+		if stored == nil {
+			return 0, nil, nil
+		}
+		code = *stored
+	}
+	cp, err := coupon.Load(ctx, tx, code)
+	if err == nil {
+		var discount int64
+		if discount, err = coupon.Discount(cp, lines, r.now()); err == nil {
+			return discount, &cp.Code, nil
+		}
+	}
+	var notApplicable *coupon.NotApplicableError
+	if !explicit && errors.As(err, &notApplicable) {
+		return 0, nil, nil
+	}
+	return 0, nil, err
 }
 
 // lockLines reads the cart lines and locks their product rows in id order, so concurrent

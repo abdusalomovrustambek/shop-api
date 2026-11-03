@@ -2,6 +2,8 @@ package auth
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -239,5 +241,55 @@ func TestOptional(t *testing.T) {
 	bad := f.token(t, authtest.DefaultKID, authtest.DefaultKID, "EdDSA", -time.Minute)
 	if rec := serve(h, bad); rec.Code != http.StatusUnauthorized {
 		t.Errorf("expired token: status %d, want 401", rec.Code)
+	}
+}
+
+func TestCachedKeysAreServedWhileAFetchIsSlow(t *testing.T) {
+	f := newFixture(t)
+	h := f.v.Require(userHandler)
+	if rec := serve(h, f.good(t)); rec.Code != http.StatusOK {
+		t.Fatalf("first request: status %d", rec.Code)
+	}
+
+	started, release := f.iss.Hold()
+	t.Cleanup(release)
+	f.clock.Advance(10 * time.Second)
+
+	// An unknown kid starts a fetch that now hangs.
+	unknown := make(chan int, 1)
+	go func() { unknown <- serve(h, f.token(t, authtest.DefaultKID, "ghost", "EdDSA", time.Hour)).Code }()
+	<-started
+
+	// Requests with a cached kid must not wait for it.
+	fast := make(chan int, 1)
+	go func() { fast <- serve(h, f.good(t)).Code }()
+	select {
+	case code := <-fast:
+		if code != http.StatusOK {
+			t.Fatalf("cached kid during a slow fetch: status %d, want 200", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a request with a cached kid waited for the slow JWKS fetch")
+	}
+
+	release()
+	if code := <-unknown; code != http.StatusUnauthorized {
+		t.Errorf("unknown kid: status %d, want 401", code)
+	}
+	if n := f.iss.Fetches(); n != 2 {
+		t.Errorf("JWKS fetched %d times, want 2 (the second one single-flight)", n)
+	}
+}
+
+func TestRequestStopsWaitingWhenItsContextEnds(t *testing.T) {
+	f := newFixture(t)
+	_, release := f.iss.Hold()
+	t.Cleanup(release)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err := f.v.Verify(ctx, f.good(t))
+	if !errors.Is(err, errKeysUnavailable) {
+		t.Fatalf("Verify with a hanging JWKS endpoint = %v, want errKeysUnavailable once ctx ends", err)
 	}
 }

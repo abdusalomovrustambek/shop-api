@@ -41,7 +41,7 @@ func Router(d Deps) *httpx.Router {
 	couponRepo := coupon.NewRepo(d.Pool)
 	catalog.NewHandler(catalog.NewRepo(d.Pool), d.Log).Register(rt)
 	cart.NewHandler(cart.NewRepo(d.Pool), couponRepo, d.Log).Register(rt)
-	order.NewHandler(order.NewRepo(d.Pool, couponRepo, d.Log), d.Log).Register(rt)
+	order.NewHandler(order.NewRepo(d.Pool, d.Log), d.Log).Register(rt)
 	httpx.RegisterDocs(rt, api.Spec)
 	rt.Handle(http.MethodGet, "/healthz", healthz(d.Pool), httpx.AuthNone)
 	return rt

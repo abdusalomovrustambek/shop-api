@@ -5,10 +5,13 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -181,5 +184,39 @@ func TestIncidentDelayIsJittered(t *testing.T) {
 	}
 	if len(seen) < 2 {
 		t.Error("the delay never varies")
+	}
+}
+
+func TestFailedCheckoutEmptiesTheCart(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, r.Method+" "+r.URL.Path)
+		mu.Unlock()
+		switch r.URL.Path {
+		case "/api/checkout":
+			http.Error(w, `{"error":{"code":"conflict","message":"sold out"}}`, http.StatusConflict)
+		case "/api/cart":
+			_, _ = w.Write([]byte(`{"items":[{"product_id":4},{"product_id":9}]}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	s := newShopper(config{baseURL: srv.URL, dryRun: false}, io.Discard, slog.New(slog.NewJSONHandler(io.Discard, nil)), 3)
+	a := s.accounts[0]
+	a.token = "t"
+	s.fast = true
+	if err := s.checkout(context.Background(), a, "USD", ""); err != nil {
+		t.Fatalf("checkout: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"POST /api/checkout", "GET /api/cart", "PATCH /api/cart/items/4", "PATCH /api/cart/items/9"}
+	if !slices.Equal(seen, want) {
+		t.Errorf("requests = %v, want %v", seen, want)
 	}
 }

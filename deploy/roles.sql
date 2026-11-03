@@ -28,10 +28,8 @@ CREATE SCHEMA IF NOT EXISTS auth AUTHORIZATION auth;
 -- migrations, which run as the table owner.
 GRANT USAGE ON SCHEMA shop TO billing;
 
--- shop-api queues charge_order jobs. USAGE on auth only lets it resolve names there:
--- it has no privilege on any auth table.
+-- shop-api queues charge_order jobs.
 GRANT USAGE ON SCHEMA billing TO shop_api;
-GRANT USAGE ON SCHEMA auth TO shop_api;
 
 -- Skipped until billing-worker's migration has created billing.jobs.
 SELECT format('GRANT INSERT ON billing.jobs TO shop_api; GRANT USAGE ON SEQUENCE %s TO shop_api',

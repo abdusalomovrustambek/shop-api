@@ -10,6 +10,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Querier is what Load needs; both *pgxpool.Pool and pgx.Tx satisfy it.
+type Querier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 // Repo loads coupons from shop.coupons.
 type Repo struct {
 	db *pgxpool.Pool
@@ -23,9 +28,15 @@ func NewRepo(db *pgxpool.Pool) *Repo {
 // ByCode loads the coupon with the given code (case-insensitive). An unknown code is a
 // NotApplicableError.
 func (r *Repo) ByCode(ctx context.Context, code string) (Coupon, error) {
+	return Load(ctx, r.db, code)
+}
+
+// Load is ByCode on any connection, so a caller inside a transaction reads through it
+// instead of taking a second connection from the pool.
+func Load(ctx context.Context, q Querier, code string) (Coupon, error) {
 	code = strings.ToUpper(strings.TrimSpace(code))
 	var c Coupon
-	err := r.db.QueryRow(ctx,
+	err := q.QueryRow(ctx,
 		`SELECT code, kind, value, min_total_cents, expires_at, only_for
 		   FROM shop.coupons WHERE code = $1`, code,
 	).Scan(&c.Code, &c.Kind, &c.Value, &c.MinTotalCents, &c.ExpiresAt, &c.OnlyFor)

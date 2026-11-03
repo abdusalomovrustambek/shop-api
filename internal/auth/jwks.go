@@ -44,6 +44,7 @@ type Verifier struct {
 	fetchedAt   time.Time
 	lastAttempt time.Time
 	lastOK      bool
+	inflight    chan struct{}
 }
 
 // NewVerifier returns a Verifier that reads keys from jwksURL.
@@ -143,37 +144,55 @@ func isUUID(s string) bool {
 	return true
 }
 
-// key returns the public key for kid. Cached keys keep working when the endpoint is
-// down; an unknown kid triggers one refetch.
+// key returns the public key for kid. A fresh cached key is returned at once. Otherwise
+// one fetch runs at a time, outside the mutex; a caller that already holds the key (stale)
+// does not wait for it, and one that does not waits only until ctx ends. Cached keys keep
+// working when the endpoint is down; an unknown kid triggers one refetch.
 func (v *Verifier) key(ctx context.Context, kid string) (ed25519.PublicKey, error) {
 	v.mu.Lock()
-	defer v.mu.Unlock()
-
 	now := v.now()
 	cached, known := v.keys[kid]
 	fresh := len(v.keys) > 0 && now.Sub(v.fetchedAt) < keyTTL
 	if known && fresh {
+		v.mu.Unlock()
 		return cached, nil
 	}
-	if !v.lastAttempt.IsZero() && now.Sub(v.lastAttempt) < minRefetch {
-		return v.fallback(cached, known)
+
+	done := v.inflight
+	switch {
+	case done != nil && known:
+		v.mu.Unlock()
+		return cached, nil
+	case done == nil:
+		if !v.lastAttempt.IsZero() && now.Sub(v.lastAttempt) < minRefetch {
+			key, err := v.fallback(cached, known)
+			v.mu.Unlock()
+			return key, err
+		}
+		done = make(chan struct{})
+		v.inflight = done
+		// The fetch belongs to the verifier, not to the request that started it.
+		go v.refresh(context.WithoutCancel(ctx), done)
+	}
+	v.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		if known {
+			return cached, nil
+		}
+		return nil, fmt.Errorf("%w: %v", errKeysUnavailable, ctx.Err())
 	}
 
-	v.lastAttempt = now
-	err := v.refresh(ctx)
-	v.lastOK = err == nil
-	if err != nil {
-		v.log.Error("fetch jwks", "err", err, "url", v.url)
-		return v.fallback(cached, known)
-	}
-	if key, ok := v.keys[kid]; ok {
-		return key, nil
-	}
-	return nil, errUnknownKey
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.fallback(v.keys[kid], v.keys[kid] != nil)
 }
 
-// fallback answers when no fetch is made or the fetch failed: a known (possibly stale)
-// key is still good, otherwise the failure tells whether the kid is unknown or the keys are out of reach.
+// fallback answers once no (further) fetch will be made: a known (possibly stale) key is
+// still good, otherwise the last fetch tells whether the kid is unknown or the keys are out
+// of reach. The caller holds v.mu.
 func (v *Verifier) fallback(cached ed25519.PublicKey, known bool) (ed25519.PublicKey, error) {
 	if known {
 		return cached, nil
@@ -191,27 +210,47 @@ type jwk struct {
 	X   string `json:"x"`
 }
 
-// refresh replaces the cached key set. The caller holds v.mu.
-func (v *Verifier) refresh(ctx context.Context) error {
-	// One client giving up must not fail the fetch for everyone waiting behind the mutex.
-	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), http.MethodGet, v.url, nil)
+// refresh fetches the key set, stores the result and closes done. The 5 second client
+// timeout bounds it.
+func (v *Verifier) refresh(ctx context.Context, done chan struct{}) {
+	keys, err := v.fetch(ctx)
+
+	v.mu.Lock()
+	v.inflight = nil
+	v.lastAttempt = v.now()
+	v.lastOK = err == nil
+	if err == nil {
+		v.keys = keys
+		v.fetchedAt = v.lastAttempt
+	}
+	v.mu.Unlock()
+
 	if err != nil {
-		return fmt.Errorf("build jwks request: %w", err)
+		v.log.Error("fetch jwks", "err", err, "url", v.url)
+	}
+	close(done)
+}
+
+// fetch downloads and parses the JWKS.
+func (v *Verifier) fetch(ctx context.Context) (map[string]ed25519.PublicKey, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, v.url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build jwks request: %w", err)
 	}
 	resp, err := v.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("fetch jwks: %w", err)
+		return nil, fmt.Errorf("fetch jwks: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("fetch jwks: unexpected status %d", resp.StatusCode)
+		return nil, fmt.Errorf("fetch jwks: unexpected status %d", resp.StatusCode)
 	}
 
 	var doc struct {
 		Keys []jwk `json:"keys"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxJWKSBytes)).Decode(&doc); err != nil {
-		return fmt.Errorf("decode jwks: %w", err)
+		return nil, fmt.Errorf("decode jwks: %w", err)
 	}
 	keys := make(map[string]ed25519.PublicKey, len(doc.Keys))
 	for _, k := range doc.Keys {
@@ -225,9 +264,7 @@ func (v *Verifier) refresh(ctx context.Context) error {
 		keys[k.Kid] = ed25519.PublicKey(x)
 	}
 	if len(keys) == 0 {
-		return errors.New("jwks has no usable Ed25519 keys")
+		return nil, errors.New("jwks has no usable Ed25519 keys")
 	}
-	v.keys = keys
-	v.fetchedAt = v.now()
-	return nil
+	return keys, nil
 }

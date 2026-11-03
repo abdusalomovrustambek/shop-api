@@ -24,6 +24,7 @@ type Issuer struct {
 	keys      map[string]ed25519.PrivateKey
 	published map[string]bool
 	down      bool
+	hold      *hold
 	fetches   int
 }
 
@@ -74,7 +75,38 @@ func (i *Issuer) Publish(kid string) {
 	i.published[kid] = true
 }
 
-func (i *Issuer) serveJWKS(w http.ResponseWriter, _ *http.Request) {
+type hold struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+// Hold makes the JWKS endpoint stall: every request waits until release is called (or the
+// client gives up). started receives a value when the first stalled request arrives.
+func (i *Issuer) Hold() (started <-chan struct{}, release func()) {
+	h := &hold{started: make(chan struct{}, 1), release: make(chan struct{})}
+	i.mu.Lock()
+	i.hold = h
+	i.mu.Unlock()
+	return h.started, func() { h.once.Do(func() { close(h.release) }) }
+}
+
+func (i *Issuer) serveJWKS(w http.ResponseWriter, r *http.Request) {
+	i.mu.Lock()
+	h := i.hold
+	i.mu.Unlock()
+	if h != nil {
+		select {
+		case h.started <- struct{}{}:
+		default:
+		}
+		select {
+		case <-h.release:
+		case <-r.Context().Done():
+			return
+		}
+	}
+
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	i.fetches++

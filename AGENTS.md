@@ -100,5 +100,5 @@ Rollout order:
 
 Rollback: `docker compose -p shop down`; add `-v` to drop the database volume.
 
-`make demo-clean` (with `DATABASE_URL` set) deletes orders older than 7 days. `make demo-break-ci` and `make demo-reset-ci`
+`make demo-clean` (with `DATABASE_URL` set) deletes orders older than 7 days and restocks products to at least 3000 units. `make demo-break-ci` and `make demo-reset-ci`
 apply and revert `demo/patches/ci-rounding.patch` for the CI demo; do not run them on a branch you intend to merge.
