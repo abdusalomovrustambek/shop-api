@@ -1,0 +1,11 @@
+diff --git a/internal/coupon/coupon.go b/internal/coupon/coupon.go
+index e689505..8116740 100644
+--- a/internal/coupon/coupon.go
++++ b/internal/coupon/coupon.go
+@@ -110,5 +110,5 @@ func (s *skuSet) has(sku string) bool { return s.m[sku] }
+ 
+ // percentOf returns pct percent of total, rounded half up to a whole cent.
+ func percentOf(total, pct int64) int64 {
+-	return (total*pct + 50) / 100
++	return total * pct / 100
+ }

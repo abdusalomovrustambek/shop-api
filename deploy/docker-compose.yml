@@ -1,0 +1,92 @@
+name: shop
+
+# The shop stack. Copy this file next to .env in /opt/shop; the images are built from /opt/shop/src/<repo>.
+# Only auth-gateway joins agnts_default, so Caddy can reach it; the rest of the stack stays on the internal shop network.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: shop
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_SECRET}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d shop"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [shop]
+
+  billing-worker:
+    build:
+      context: ${SHOP_SRC:-/opt/shop/src}/billing-worker
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${BILLING_DATABASE_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [shop]
+
+  shop-api:
+    build:
+      context: ${SHOP_SRC:-/opt/shop/src}/shop-api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${SHOP_API_DATABASE_URL}
+      AUTH_JWKS_URL: http://auth-gateway:8080/.well-known/jwks.json
+      LOG_LEVEL: debug
+      ADDR: ":8081"
+    healthcheck:
+      test: ["CMD", "/app/shop-api", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      billing-worker:
+        condition: service_started
+    networks: [shop]
+
+  auth-gateway:
+    build:
+      context: ${SHOP_SRC:-/opt/shop/src}/auth-gateway
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${AUTH_DATABASE_URL}
+      SHOP_API_URL: http://shop-api:8081
+      WEB_DIR: /srv/web
+    volumes:
+      - /opt/shop/web:/srv/web:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [shop, agnts_default]
+
+  shopper:
+    build:
+      context: ${SHOP_SRC:-/opt/shop/src}/shop-api
+    restart: unless-stopped
+    entrypoint: ["/app/shopper"]
+    environment:
+      SHOPPER_BASE_URL: http://auth-gateway:8080
+      SHOPPER_INCIDENT_EVERY: ${SHOPPER_INCIDENT_EVERY:-60s}
+      # Unset runs every incident; empty runs none.
+      SHOPPER_INCIDENTS: ${SHOPPER_INCIDENTS-api-1,api-2,api-3,zero-qty,uzs,brute,scan}
+    depends_on:
+      - auth-gateway
+      - shop-api
+    networks: [shop]
+
+volumes:
+  pgdata:
+
+networks:
+  shop:
+    internal: true
+  agnts_default:
+    external: true
