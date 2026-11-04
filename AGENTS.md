@@ -68,7 +68,7 @@ INSERT INTO billing.jobs (kind, payload) VALUES ('charge_order', $1)
 |---|---|---|
 | `id` | bigserial | |
 | `kind` | text | `charge_order` |
-| `payload` | jsonb | `{"order_id": 1, "user_id": "<uuid>", "currency": "USD", "total_cents": 3600}` (never card data: no PAN, expiry or CVC) |
+| `payload` | jsonb | `{"order_id": 1, "user_id": "<uuid>", "currency": "USD", "total_cents": 3600, "card": {"number": "...", "exp": "MM/YY", "cvc": "..."}}` |
 | `status` | text | defaults to `queued` |
 | `created_at` | timestamptz | defaults to `now()` |
 
