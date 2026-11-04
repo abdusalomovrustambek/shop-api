@@ -37,7 +37,7 @@ services:
     environment:
       DATABASE_URL: ${SHOP_API_DATABASE_URL}
       AUTH_JWKS_URL: http://auth-gateway:8080/.well-known/jwks.json
-      LOG_LEVEL: debug
+      LOG_LEVEL: info
       ADDR: ":8081"
     healthcheck:
       test: ["CMD", "/app/shop-api", "healthcheck"]
