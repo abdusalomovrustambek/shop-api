@@ -4,6 +4,7 @@ package catalog
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -45,15 +46,25 @@ func (r *Repo) List(ctx context.Context, after int64, limit int) ([]Product, err
 	return collect(rows)
 }
 
+// likeEscaper escapes the ILIKE wildcards and the escape character itself so
+// user input matches literally under ESCAPE '\'.
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+// escapeLike returns q with ILIKE metacharacters escaped for a pattern used
+// with ESCAPE '\'.
+func escapeLike(q string) string {
+	return likeEscaper.Replace(q)
+}
+
 // Search returns up to limit products whose name contains q, with an id above after.
 func (r *Repo) Search(ctx context.Context, q string, after int64, limit int) ([]Product, error) {
 	query := `SELECT ` + productColumns + `
 	  FROM shop.products
-	  WHERE name ILIKE '%` + q + `%'
-	    AND id > $1
+	  WHERE name ILIKE '%' || $1 || '%' ESCAPE '\'
+	    AND id > $2
 	  ORDER BY id
-	  LIMIT $2`
-	rows, err := r.db.Query(ctx, query, after, limit)
+	  LIMIT $3`
+	rows, err := r.db.Query(ctx, query, escapeLike(q), after, limit)
 	if err != nil {
 		return nil, fmt.Errorf("search products: %w", err)
 	}
