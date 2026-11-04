@@ -72,6 +72,38 @@ func TestLoggerWritesOneRequestLine(t *testing.T) {
 	}
 }
 
+func TestLoggerNeverLogsCredentialsAtDebug(t *testing.T) {
+	var logs bytes.Buffer
+	h := Chain(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}), Logger(newTestLogger(&logs, slog.LevelDebug)))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/things", nil)
+	req.Header.Set("Authorization", "Bearer live-sentinel-token")
+	req.Header.Set("Cookie", "session=live-sentinel-cookie")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if strings.Contains(logs.String(), "live-sentinel-token") {
+		t.Errorf("debug logs contain the bearer token: %s", logs.String())
+	}
+	if strings.Contains(logs.String(), "live-sentinel-cookie") {
+		t.Errorf("debug logs contain the cookie: %s", logs.String())
+	}
+
+	var debug map[string]any
+	for _, line := range logLines(t, &logs) {
+		if line["msg"] == "request headers" {
+			debug = line
+		}
+	}
+	if debug == nil {
+		t.Fatalf("no debug \"request headers\" line: %s", logs.String())
+	}
+	if debug["method"] != "GET" || debug["path"] != "/api/things" {
+		t.Errorf("debug line = %v, want method GET and path /api/things", debug)
+	}
+}
+
 func TestLoggerFallsBackToThePeerAddress(t *testing.T) {
 	var logs bytes.Buffer
 	h := Chain(http.NotFoundHandler(), Logger(newTestLogger(&logs, slog.LevelInfo)))

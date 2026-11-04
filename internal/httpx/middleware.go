@@ -62,7 +62,8 @@ func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter 
 
 // Logger writes one "request" line per request: method, path, route pattern, status,
 // duration_ms, ip (from X-Forwarded-For) and user id. At debug level it also logs the
-// request headers.
+// method and path. Request headers are never logged: Authorization carries a live
+// credential and Cookie may carry session secrets.
 func Logger(log *slog.Logger) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -72,7 +73,8 @@ func Logger(log *slog.Logger) Middleware {
 			rec := &statusRecorder{ResponseWriter: w}
 
 			if log.Enabled(req.Context(), slog.LevelDebug) {
-				log.Debug("request headers", "method", r.Method, "path", r.URL.Path, "headers", r.Header)
+				// Authorization must never be logged: it is a live credential.
+				log.Debug("request headers", "method", r.Method, "path", r.URL.Path)
 			}
 
 			next.ServeHTTP(rec, req)
