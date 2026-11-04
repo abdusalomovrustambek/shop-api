@@ -21,7 +21,8 @@ const listLimit = 100
 // chargeOrderKind is the billing.jobs kind billing-worker picks up.
 const chargeOrderKind = "charge_order"
 
-// Card is the card data the buyer sends. It goes into the billing job and nowhere else.
+// Card is the card data the buyer sends. It is validated at the API boundary and
+// lives only in memory during checkout; it is never persisted.
 type Card struct {
 	Number string `json:"number"`
 	Exp    string `json:"exp"`
@@ -58,13 +59,14 @@ type Order struct {
 	Items         []Item    `json:"items"`
 }
 
-// jobPayload is the payload of a billing.jobs row of kind charge_order.
+// jobPayload is the payload of a billing.jobs row of kind charge_order. It must
+// never carry card data: no PAN, expiry or CVC. The card the buyer sends is used
+// only in memory during checkout; the job carries the order reference alone.
 type jobPayload struct {
 	OrderID    int64  `json:"order_id"`
 	UserID     string `json:"user_id"`
 	Currency   string `json:"currency"`
 	TotalCents int64  `json:"total_cents"`
-	Card       Card   `json:"card"`
 }
 
 // line is a cart line joined with its locked product row.
@@ -167,7 +169,9 @@ func (r *Repo) Checkout(ctx context.Context, in CheckoutInput) (Order, error) {
 		o.Items = append(o.Items, Item{ProductID: l.ProductID, Name: l.Name, UnitPriceCents: l.UnitPriceCents, Quantity: l.Quantity})
 	}
 
-	payload := jobPayload{OrderID: o.ID, UserID: in.UserID, Currency: o.Currency, TotalCents: o.TotalCents, Card: in.Card}
+	// The buyer's card is never persisted: the job carries the order reference
+	// alone, and billing charges from it.
+	payload := jobPayload{OrderID: o.ID, UserID: in.UserID, Currency: o.Currency, TotalCents: o.TotalCents}
 	if _, err = tx.Exec(ctx,
 		`INSERT INTO billing.jobs (kind, payload) VALUES ($1, $2)`, chargeOrderKind, payload); err != nil {
 		return Order{}, fmt.Errorf("enqueue %s job: %w", chargeOrderKind, err)
