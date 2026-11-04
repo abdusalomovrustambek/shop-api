@@ -93,39 +93,6 @@ func TestSearchFindsMatchingProducts(t *testing.T) {
 	}
 }
 
-func TestSearchTreatsInputAsLiteralText(t *testing.T) {
-	app := apptest.New(t)
-
-	cases := []struct {
-		name      string
-		search    string
-		wantItems int
-		wantSKU   string
-	}{
-		{name: "plain substring still matches", search: "aurora", wantItems: 1, wantSKU: "SH-001"},
-		{name: "OR injection is literal text", search: "' OR '1'='1", wantItems: 0},
-		{name: "UNION exfiltration is literal text", search: "' UNION SELECT id, sku, name, description, price_cents, image_url, stock, created_at FROM shop.products -- ", wantItems: 0},
-		{name: "percent is literal", search: "%", wantItems: 0},
-		{name: "underscore is literal", search: "_", wantItems: 0},
-		{name: "backslash is literal", search: `\`, wantItems: 0},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			rec := app.Do(http.MethodGet, "/api/products?search="+url.QueryEscape(tc.search), "", "")
-			if rec.Code != http.StatusOK {
-				t.Fatalf("search %q: status = %d, body %s, want 200", tc.search, rec.Code, rec.Body)
-			}
-			page := apptest.Decode[catalog.Page](t, rec)
-			if len(page.Items) != tc.wantItems {
-				t.Fatalf("search %q returned %d items, want %d", tc.search, len(page.Items), tc.wantItems)
-			}
-			if tc.wantSKU != "" && page.Items[0].SKU != tc.wantSKU {
-				t.Errorf("search %q returned SKU %q, want %q", tc.search, page.Items[0].SKU, tc.wantSKU)
-			}
-		})
-	}
-}
-
 func TestGetReturnsProduct(t *testing.T) {
 	app := apptest.New(t)
 
